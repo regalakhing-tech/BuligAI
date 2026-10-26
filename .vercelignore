@@ -1,0 +1,17 @@
+.git/
+.github/
+.cache/
+.phpunit.cache/
+.env
+.env.*
+vendor/
+node_modules/
+storage/
+tests/
+docs/
+supabase/
+BuligAI_Project_Concept.md
+README.md
+CONTRIBUTING.md
+phpunit.xml
+phpcs.xml

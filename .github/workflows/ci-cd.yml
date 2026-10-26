@@ -1,0 +1,108 @@
+name: BuligAI CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: buligai-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  quality:
+    name: PHP quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: curl, fileinfo, mbstring, openssl, dom, xml, xmlwriter
+          tools: composer:v2
+          coverage: none
+      - run: composer validate --strict
+      - run: composer install --no-interaction --prefer-dist --no-progress
+      - run: composer check
+      - run: composer audit --locked
+
+  storage-policies:
+    name: Supabase policy tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.122.0
+      - name: Start isolated local Supabase
+        run: supabase start -x studio,imgproxy,realtime,edge-runtime,logflare,vector,supavisor
+      - run: supabase test db
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup
+
+  http:
+    name: HTTP smoke (${{ matrix.driver }})
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        driver: [file, cookie]
+    env:
+      APP_ENV: local
+      SESSION_DRIVER: ${{ matrix.driver }}
+      VERCEL: ${{ matrix.driver == 'cookie' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: curl, fileinfo, mbstring, openssl
+          tools: composer:v2
+          coverage: none
+      - run: composer install --no-dev --no-interaction --prefer-dist --no-progress
+      - name: Generate an isolated test session key
+        run: php -r 'echo "APP_KEY=" . base64_encode(random_bytes(32)) . PHP_EOL;' >> "$GITHUB_ENV"
+      - name: Check PHP HTTP entry point
+        shell: bash
+        run: |
+          set -euo pipefail
+          php -S 127.0.0.1:8000 -t public api/index.php > /tmp/buligai-http.log 2>&1 &
+          task_server_pid=$!
+          trap 'kill "$task_server_pid"; cat /tmp/buligai-http.log' EXIT
+          composer smoke -- http://127.0.0.1:8000
+
+  deploy:
+    name: Deploy to Vercel
+    needs: [quality, storage-policies, http]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check deployment configuration
+        run: |
+          test -n "$VERCEL_TOKEN"
+          test -n "$VERCEL_ORG_ID"
+          test -n "$VERCEL_PROJECT_ID"
+      - name: Pull production project settings
+        run: npx --yes vercel@65.2.0 pull --yes --environment=production --token="$VERCEL_TOKEN"
+      - name: Build checked production source
+        run: npx --yes vercel@65.2.0 build --prod --token="$VERCEL_TOKEN"
+      - name: Deploy prebuilt output
+        run: npx --yes vercel@65.2.0 deploy --prebuilt --prod --token="$VERCEL_TOKEN"
